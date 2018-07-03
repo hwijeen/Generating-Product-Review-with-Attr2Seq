@@ -4,27 +4,19 @@ import torch
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 
-# class Config():
-#     csv_file = 'data/complete_df.csv'
-#     vocab_file = 'crawling/Reviews_csv/vocab.txt'
-#     tag_vocab = 'crawling/tags_txt/tag_vocab.txt'
-#     rating_dict = {'불만':0, '추천안함':0,
-#                     '보통':1,
-#                     '추천':2, '만족':2,
-#                     '적극추천':3}
-#     category = 'subcat'    # 'subcat' or 'category'
-    
-#     batch_size = 5
+PAD_IDX = 0
+SOS_TOKEN = 1
+EOS_TOKEN = 2
 
 class Data(Dataset):
     def __init__(self, csv_file, vocab_file, tag_vocab, rating_dict, category):
         self.data_df = pd.read_csv(csv_file, index_col=0)
         self.category = category
-        self.word2idx = {'PAD':0, 'SOS':1, 'EOS':2}
-        #self.idx2word = {}    # 여기서 필요 없을 수도?
-        self.tag2idx = {}
+        self.word2idx = {'PAD':PAD_IDX, 'SOS':SOS_TOKEN, 'EOS':EOS_TOKEN}
+        self.idx2word = {}    
+        self.tag2idx = {'PAD':PAD_IDX}
         self.rating2idx = rating_dict
-        self.category2idx = {category:idx for idx, category                             in enumerate(set(self.data_df[category]))}
+        self.category2idx = {category:idx for idx, category in enumerate(set(self.data_df[category]))}
         self.build_vocab(vocab_file)
         self.build_tag(tag_vocab)
         
@@ -33,7 +25,7 @@ class Data(Dataset):
             word, count = line.split(' ')
             if word not in self.word2idx:
                 self.word2idx[word] = len(self.word2idx)
-        #{self.idx2word[idx]:word for word, idx in self.word2idx.items()}
+        self.idx2word = {idx:word for word, idx in self.word2idx.items()}
     
     def build_tag(self, tag_vocab):
         for tag in open(tag_vocab, "r"):

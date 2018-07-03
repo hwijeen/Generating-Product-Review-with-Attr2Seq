@@ -1,253 +1,144 @@
-
 # coding: utf-8
-
-# ## TODO
-# 1. Batching!   
-#     -Encoder.Forward의 input 모양 어떻게 되지? / .view 인자 확인!
-# 2. Attention  
-# 3. Teacher Forcing  
-# 4. Parameter(things to be updated) 등록 잘 됐나 확인
-
-# #### NOTE
-# 1. Decoder가 2 layer일때, initial hidden?  
-#     - https://discuss.pytorch.org/t/understanding-output-of-lstm/12320/2
-
-# In[1]:
-
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import optim
-
-
-# In[2]:
-
-
-class Config():
-    # Encoder
-    rating_size = 5
-    category_size = 10
-    tag_size = 3
-    pretrained = False 
-    # embedding_size = 300    # needed when not using pretrained vector
-    attribute_size = 64
-    hidden_size = 512 # fixed-vector size 
-    # word-embedding = hidden_size
-    
-    # Decoder
-    num_layers = 2
-    output_size = 10
-
-
-# In[3]:
-
 
 class Encoder(nn.Module):
-    def __init__(self, config):        
+    def __init__(self, config):
         super().__init__()
         self.config = config
-        
-        # Embedding instead of Linear for efficient indexing
-        self.emb_rating = nn.Embedding(self.config.rating_size, self.config.attribute_size)   
+
+        self.emb_rating = nn.Embedding(self.config.rating_size, self.config.attribute_size)
         self.emb_category = nn.Embedding(self.config.category_size, self.config.attribute_size)
-        self.emb_tag = nn.Embedding(self.config.tag_size, self.config.attribute_size)
+        self.emb_tag = nn.Embedding(self.config.tag_size, self.config.attribute_size, padding_idx=self.config.padding_idx)
         self.out = nn.Linear(self.config.attribute_size * 3, self.config.hidden_size*self.config.num_layers)
         self.init_hidden()
-        
+
     def forward(self, rating, category, tag):
         """
         Inputs:
-            rating: TENSOR of shape (1, )
-            category: TENSOR of shape (1, )
-            tag : 1) TENSOR of shape (tag_size, )
+            rating: TENSOR of shape (batch_size, 1)
+            category: TENSOR of shape (batch_size, 1)
+            tag : 1) TENSOR of shape (batch_size, tag_MAXLEN)
         Returns:
             concatenated attr for attention, encoder_output
         """
-        # TODO: check if len(rating), len(category), len(tag) matches
-        attr_rating = self.emb_rating(rating).view(1,1,-1)    # shape?!
-        attr_category = self.emb_category(category).view(1,1,-1)
-        attr_tag = torch.sum(self.emb_tag(tag), 0) / len(tag)    # embedding 평균
-        attr_tag = attr_tag.view(1,1,-1)
-        
-        attr = torch.cat((attr_rating, attr_category, attr_tag), 2)    # specify dim?
-        out = self.out(attr)
+
+        assert len(rating) == len(category) == len(tag)
+        attr_rating = self.emb_rating(rating)        # N x 1 x attr_size
+        attr_category = self.emb_category(category)  # N x 1 x attr_size
+        tag_len = self.get_tag_len(tag)
+        attr_tag = torch.sum(self.emb_tag(tag), 1, keepdim=True) / tag_len    # CBOW
+                                                     # N x max_tag_len x attr_size
+                                                     # N x 1 x attr_size*3
+        attr = torch.cat((attr_rating, attr_category, attr_tag), 2)
+        out = self.out(attr)    # N x 1 x hidden_size * num_layers(decoder)
+        attr = attr.view(self.config.batch_size, self.config.num_attr, -1)  # N x 3 x 64
         encoder_output = F.tanh(out)
         return attr, encoder_output
+
+    def get_tag_len(self, tag):
+        """padding 제외한 token 개수"""
+        return torch.sum(tag!=self.config.padding_idx, 1).unsqueeze(1).unsqueeze(1).type(torch.float)
+
+    def init_hidden(self):
+        for param in self.parameters():
+            nn.init.uniform_(param, -0.08, 0.08)
+
+            
+class Decoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        self.embedding = nn.Embedding(self.config.output_size, self.config.hidden_size)
+        self.lstm = nn.LSTM(self.config.hidden_size, self.config.hidden_size,                             num_layers=self.config.num_layers, dropout=self.config.dropout,                            batch_first=True)
+        self.out = nn.Linear(self.config.hidden_size, self.config.output_size)
+        self.init_hidden()
+
+    def forward(self, input_token, hidden):
+        """
+        Inputs:
+            input_token: TENSOR of shape (batch_size, 1)
+            hidden: from last hidden of encoder (h_0, c_0) batch first
+                        h_0 - num_layers * num_direction X batch X hidden_size
+                        c_0 - num_layers * num_direction X batch X hidden_size
+        Returns:
+        """
+        # 가운데 1이니까 unroll방식으로만!  - 바꿀 수 있나?!
+        output = self.embedding(input_token)          # N x 1(seq_len) x hidden_size
+        # LSTM의 hidden은 (hx, cx)
+        output, hidden = self.lstm(output, hidden)    # N x 1(seq_len) x hidden_size * num_dir
+                                                      # num_layers * num_direction x N x hidden_size
+        output = self.out(output)    # N x 1(seq_len) x output_size
+        output = F.log_softmax(output, dim=2)
+        return output, hidden
+
+    def init_hidden(self):
+        for param in self.parameters():
+            nn.init.uniform_(param, -0.08, 0.08)
+
+
+class Attention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.attn_score = nn.Linear(self.config.hidden_size + self.config.attribute_size, 1)
+        self.init_hidden()
+
+    def forward(self, last_hidden, attrs):
+        # last_hidden : torch.Size([num_layers*num_direction, seq_len, hidden_dim])
+        # attrs : torch.Size([batch_size, num_attr, attr_size])
+        attn_energies = torch.zeros((self.config.batch_size, 1, self.config.num_attr))
+        # B x 1(seq_len인가?) x 3
+        for i in range(self.config.num_attr):
+            attn_energies[:,:,i] = self.score(last_hidden.squeeze(), attrs[:,i,:])
+        return F.softmax(attn_energies, dim=-1)#.unsqueeze(0).unsqueeze(0) # 1,1,3
+
+    def score(self, last_hidden, attr):
+        energy = self.attn_score(torch.cat((last_hidden, attr.squeeze()), -1))
+        energy = F.tanh(energy)    # (batch, 1)
+        return energy
     
     def init_hidden(self):
         for param in self.parameters():
             nn.init.uniform_(param, -0.08, 0.08)
 
 
-# In[4]:
-
-
-print("Testing encoder...\n")
-config = Config()
-encoder = Encoder(config)
-rating = torch.tensor([3]).type(torch.long)    # idx of rating in tensor
-category = torch.tensor([7]).type(torch.long)  # idx of category in tensor
-tag = torch.tensor([1,2,1]).type(torch.long)    # CBOW of one-hot
-attr, encoder_output = encoder(rating,category,tag)
-print(attr.size())
-print(encoder_output.size())
-
-
-# In[5]:
-
-
-class Decoder(nn.Module):
+class AttnDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        
-        # TODO: if self.config.pretrained = True
         self.embedding = nn.Embedding(self.config.output_size, self.config.hidden_size)
-        self.lstm = nn.LSTM(self.config.hidden_size, self.config.hidden_size,                             num_layers=self.config.num_layers, dropout=0.2)
+        self.lstm = nn.LSTM(self.config.hidden_size, self.config.hidden_size, num_layers=self.config.num_layers, dropout=self.config.dropout,                            batch_first=True)
+        self.attn_out = nn.Linear(self.config.hidden_size + self.config.attribute_size,
+                                  self.config.hidden_size)
         self.out = nn.Linear(self.config.hidden_size, self.config.output_size)
-        
-    def forward(self, input_token, hidden):
-        """
-        Inputs:
-            input_token: TENSOR of shape (1,1,1)
-            hidden: from last hidden of encoder
-        Returns:
-            concatenated attr for attention, encoder_output
-        """
-        output = self.embedding(input_token).view(len(input_token), 1, -1)
-        # LSTM의 hidden은 (hx, cx)
-        output, hidden = self.lstm(output, hidden)
-        output = self.out(output)
-        output = F.log_softmax(output, dim=2)
-        return output, hidden
 
-    def initHidden(self):
-        pass
+        self.attn = Attention(self.config)
+        self.init_hidden()
 
+    def forward(self, input_token, hidden, attrs):
 
-# In[6]:
+        word_embedded = self.embedding(input_token)
+        output, hidden = self.lstm(word_embedded, hidden)
 
+        attn_weights = self.attn(output, attrs)
 
-print("testing decoder with encoder_output...\n")
-decoder = Decoder(config)
-# h_ = torch.split(encoder_output,[config.hidden_size, config.hidden_size], 2)
-# h_ = torch.cat(h_, dim=0)
-h_ = encoder_output.view(config.num_layers, 1, config.hidden_size)
-c_ = encoder_output.view(config.num_layers, 1, config.hidden_size)
-hidden = h_, c_
+        attrs = attrs.view(self.config.batch_size, self.config.num_attr, -1)
+        context = attn_weights.bmm(attrs)
+        output = F.tanh(self.attn_out(torch.cat((output, context), -1)))
+        output = F.log_softmax(self.out(output), dim=-1)
 
-input_token = torch.tensor([0,0,0])
-output, hidden = decoder(input_token, hidden)
-print("input_token.size(): ", input_token.size())
-print("hidden[0].size(): ", hidden[0].size())
-print("hidden[1].size(): ", hidden[1].size())
-print("output.size(): ", output.size())
+        return output, hidden, attn_weights
+
+    def init_hidden(self):
+        for param in self.parameters():
+            nn.init.uniform_(param, -0.08, 0.08)
 
 
 
-# In[7]:
 
 
-class Attr2Seq(nn.Module):
-    def __init__(self, config, criterion):
-        super().__init__()
-        self.config = config
-        self.criterion = criterion
-        self.encoder = Encoder(config)
-        self.decoder = Decoder(config)
-    
-    def forward(self, rating, category, tag, target_tensor):
-        # 함수 호출시 *[rating, category, tag]하기!
-        # target_tensor도 1차원!!!!
-        target_length = target_tensor.size(0)    
-        attr, encoder_output = self.encoder(rating,category,tag)
-        
-        hidden = self.splitHidden(encoder_output)
-        input_token = torch.zeros((1,1,1)).type(torch.long)    # SOS token
-        
-        decoder_outputs = []
-        for idx in range(target_length):
-            decoder_output, decoder_hidden = decoder(input_token, hidden)
-            topv, topi = decoder_output.topk(1)
-            input_token = topi.detach()            
-            decoder_outputs.append(decoder_output.squeeze())
-        decoder_outputs = torch.cat(decoder_outputs, 0).view(target_length, -1)
-        loss = self.criterion(decoder_outputs, target_tensor)
-        return loss
-    
-    def splitHidden(self, encoder_output):
-        """
-        Encoder의 ouput인 fixed size vector를 Decoder의 hidden으로 쪼개기
-        """
-        return encoder_output.view(self.config.num_layers, 1, self.config.hidden_size),                 encoder_output.view(self.config.num_layers, 1, self.config.hidden_size)    
-    
-    def inference(self):
-        pass
-
-
-# In[17]:
-
-
-criterion = nn.NLLLoss()
-model = Attr2Seq(config, criterion)
-input_list = [torch.tensor([2]).type(torch.long), torch.tensor([7]).type(torch.long),
-              torch.tensor([0,2,1])]
-#target_tensor = torch.tensor([[3],[3],[4],[6]])
-target_tensor = torch.tensor([9,2,1,3])
-loss = model(*input_list, target_tensor)
-print(loss)
-
-
-# In[9]:
-
-
-def train(input_list, target_tensor, model, optimizer):
-    """
-    perform a step(update)
-    """
-    optimizer.zero_grad()
-    
-    target_length = target_tensor.size(0)
-    
-    loss = model(*input_list, target_tensor)
-
-    loss.backward()
-    optimizer.step()
-    return loss.item() / target_length
-
-
-# In[18]:
-
-
-optimizer = optim.SGD(model.parameters(), lr=0.002)
-avg_loss = train(input_list, target_tensor, model, optimizer)
-print(avg_loss)
-
-
-# In[13]:
-
-
-def trainIters():
-    pass
-
-
-# In[9]:
-
-
-def evaluate():
-    pass
-
-
-# In[10]:
-
-
-def evaluateRandomly():
-    pass
-
-
-# In[190]:
-
-
-print(model)
 
